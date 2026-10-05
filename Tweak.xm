@@ -2,6 +2,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <math.h>
+#import <string.h>
 
 @interface NCNotificationShortLookView : UIView
 @end
@@ -100,6 +101,57 @@ static BOOL IN_IsBannerView(UIView *v) {
     return NO;
 }
 
+static int IN_SamplePageLuminance(CGFloat *outLum) {
+    *outLum = -1.0;
+    @try {
+        UIScreen *screen = [UIScreen mainScreen];
+        UIView *snap = [screen snapshotViewAfterScreenUpdates:NO];
+        if (!snap) {
+            return -1;
+        }
+        CGFloat W = CGRectGetWidth(screen.bounds);
+        CGRect sample = CGRectMake(W * 0.2, 50.0, W * 0.6, 90.0);
+        const size_t side = 16;
+        uint8_t buf[16 * 16 * 4];
+        memset(buf, 0, sizeof(buf));
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(buf, side, side, 8, side * 4, cs,
+                                                 kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(cs);
+        if (!ctx) {
+            return -1;
+        }
+        CGContextTranslateCTM(ctx, 0.0, (CGFloat)side);
+        CGContextScaleCTM(ctx, (CGFloat)side / sample.size.width, -((CGFloat)side / sample.size.height));
+        CGContextTranslateCTM(ctx, -sample.origin.x, -sample.origin.y);
+        UIGraphicsPushContext(ctx);
+        BOOL ok = [snap drawViewHierarchyInRect:snap.bounds afterScreenUpdates:NO];
+        UIGraphicsPopContext();
+        CGContextRelease(ctx);
+        if (!ok) {
+            return -1;
+        }
+        double r = 0.0, g = 0.0, b = 0.0, a = 0.0;
+        for (size_t i = 0; i < side * side; i++) {
+            r += buf[i * 4];
+            g += buf[i * 4 + 1];
+            b += buf[i * 4 + 2];
+            a += buf[i * 4 + 3];
+        }
+        if (a < 1.0) {
+            return -1;
+        }
+        r /= a;
+        g /= a;
+        b /= a;
+        CGFloat lum = (CGFloat)(0.2126 * r + 0.7152 * g + 0.0722 * b);
+        *outLum = lum;
+        return lum > 0.5 ? 1 : 0;
+    } @catch (NSException *e) {
+        return -1;
+    }
+}
+
 static CGRect IN_TargetRect(UIView *banner, UIView *overlay) {
     CGFloat W = CGRectGetWidth(overlay.bounds);
     CGRect r = [banner convertRect:banner.bounds toView:overlay];
@@ -142,9 +194,9 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
 @property (nonatomic, assign) CFTimeInterval startTime;
 @property (nonatomic, assign) BOOL revealed;
 @property (nonatomic, assign) BOOL finished;
-@property (nonatomic, assign) BOOL dark;
+@property (nonatomic, assign) BOOL darkCard;
 @property (nonatomic, assign) BOOL loggedRect;
-+ (BOOL)startForBanner:(UIView *)banner;
++ (BOOL)startForBanner:(UIView *)banner darkCard:(BOOL)darkCard;
 - (void)render:(CFTimeInterval)t;
 - (void)tick:(CADisplayLink *)link;
 - (void)finish;
@@ -152,7 +204,7 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
 
 @implementation INDriver
 
-+ (BOOL)startForBanner:(UIView *)banner {
++ (BOOL)startForBanner:(UIView *)banner darkCard:(BOOL)darkCard {
     UIWindow *window = banner.window;
     if (!window) {
         return NO;
@@ -168,7 +220,7 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
 
     INDriver *d = [[INDriver alloc] init];
     d.banner = banner;
-    d.dark = (window.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    d.darkCard = darkCard;
 
     UIView *ov = [[UIView alloc] initWithFrame:rect];
     ov.userInteractionEnabled = NO;
@@ -261,7 +313,7 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
     CGFloat cxB = IN_Lerp(cx, CGRectGetMidX(R), sp);
 
     CGFloat f = IN_Smooth(IN_Clamp01((CGFloat)((t - 0.08) / 0.55)));
-    CGFloat finalLum = self.dark ? 0.17 : 1.0;
+    CGFloat finalLum = self.darkCard ? 0.10 : 1.0;
     UIColor *color = [UIColor colorWithWhite:IN_Lerp(0.0, finalLum, f) alpha:1.0];
 
     CGRect br = CGRectMake(cxB - w / 2.0, by - h / 2.0, w, h);
@@ -348,6 +400,7 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
 
     static int bannerLogCount = 0;
     static int otherLogCount = 0;
+    static int styleLogCount = 0;
 
     if (!IN_IsBannerView(self)) {
         if (otherLogCount < 6) {
@@ -372,7 +425,27 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
     objc_setAssociatedObject(self, &kLastAnimKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     self.alpha = 0.0;
-    if (![INDriver startForBanner:self]) {
+
+    CGFloat lum = -1.0;
+    int pageLight = IN_SamplePageLuminance(&lum);
+    BOOL darkCard;
+    if (pageLight == 1) {
+        darkCard = YES;
+    } else if (pageLight == 0) {
+        darkCard = NO;
+    } else {
+        darkCard = (self.window.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    }
+
+    if (styleLogCount < 8) {
+        styleLogCount++;
+        IN_Log([NSString stringWithFormat:@"STYLE lum=%.2f pageLight=%d darkCard=%d",
+                lum, pageLight, (int)darkCard]);
+    }
+
+    self.overrideUserInterfaceStyle = darkCard ? UIUserInterfaceStyleDark : UIUserInterfaceStyleLight;
+
+    if (![INDriver startForBanner:self darkCard:darkCard]) {
         self.alpha = 1.0;
     }
 }
@@ -412,7 +485,7 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
             IN_Log(@"NCNotificationShortLookView not found, tweak inactive");
             return;
         }
-        IN_Log([NSString stringWithFormat:@"IslandNotify v3 loaded on iOS %@",
+        IN_Log([NSString stringWithFormat:@"IslandNotify v4 loaded on iOS %@",
                 [[UIDevice currentDevice] systemVersion]]);
         %init(IslandHooks);
     }
