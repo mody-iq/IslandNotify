@@ -101,14 +101,9 @@ static BOOL IN_IsBannerView(UIView *v) {
     return NO;
 }
 
-static int IN_SamplePageLuminance(CGFloat *outLum) {
-    *outLum = -1.0;
+static int IN_RenderSample(UIView *snap, UIWindow *window, BOOL useLayer, CGFloat *outLum) {
     @try {
         UIScreen *screen = [UIScreen mainScreen];
-        UIView *snap = [screen snapshotViewAfterScreenUpdates:NO];
-        if (!snap) {
-            return -1;
-        }
         CGFloat W = CGRectGetWidth(screen.bounds);
         CGRect sample = CGRectMake(W * 0.2, 50.0, W * 0.6, 90.0);
         const size_t side = 16;
@@ -124,13 +119,22 @@ static int IN_SamplePageLuminance(CGFloat *outLum) {
         CGContextTranslateCTM(ctx, 0.0, (CGFloat)side);
         CGContextScaleCTM(ctx, (CGFloat)side / sample.size.width, -((CGFloat)side / sample.size.height));
         CGContextTranslateCTM(ctx, -sample.origin.x, -sample.origin.y);
-        UIGraphicsPushContext(ctx);
-        BOOL ok = [snap drawViewHierarchyInRect:snap.bounds afterScreenUpdates:NO];
-        UIGraphicsPopContext();
+
+        BOOL ok = YES;
+        if (useLayer) {
+            [snap.layer renderInContext:ctx];
+        } else {
+            UIGraphicsPushContext(ctx);
+            [window insertSubview:snap atIndex:0];
+            ok = [snap drawViewHierarchyInRect:snap.bounds afterScreenUpdates:NO];
+            [snap removeFromSuperview];
+            UIGraphicsPopContext();
+        }
         CGContextRelease(ctx);
         if (!ok) {
             return -1;
         }
+
         double r = 0.0, g = 0.0, b = 0.0, a = 0.0;
         for (size_t i = 0; i < side * side; i++) {
             r += buf[i * 4];
@@ -138,7 +142,7 @@ static int IN_SamplePageLuminance(CGFloat *outLum) {
             b += buf[i * 4 + 2];
             a += buf[i * 4 + 3];
         }
-        if (a < 1.0) {
+        if (a < 255.0 * 20.0) {
             return -1;
         }
         r /= a;
@@ -150,6 +154,107 @@ static int IN_SamplePageLuminance(CGFloat *outLum) {
     } @catch (NSException *e) {
         return -1;
     }
+}
+
+static BOOL IN_ColorLum(UIColor *c, UITraitCollection *tc, CGFloat *lum) {
+    if (!c) {
+        return NO;
+    }
+    UIColor *rc = c;
+    if (tc) {
+        rc = [c resolvedColorWithTraitCollection:tc];
+    }
+    CGFloat r = 0.0, g = 0.0, b = 0.0, a = 0.0;
+    if ([rc getRed:&r green:&g blue:&b alpha:&a]) {
+        *lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        return YES;
+    }
+    CGFloat w = 0.0;
+    if ([rc getWhite:&w alpha:&a]) {
+        *lum = w;
+        return YES;
+    }
+    return NO;
+}
+
+static UIColor *IN_ScanStatusColor(UIView *v, BOOL inStatus, int depth, int *budget) {
+    if ((*budget)-- <= 0 || depth > 16) {
+        return nil;
+    }
+    NSString *cn = NSStringFromClass([v class]);
+    BOOL st = inStatus ||
+              ([cn rangeOfString:@"StatusBar" options:NSCaseInsensitiveSearch].location != NSNotFound);
+    if (st && !v.hidden && v.alpha > 0.1) {
+        if ([v isKindOfClass:[UILabel class]]) {
+            UILabel *l = (UILabel *)v;
+            if (l.text.length > 0 && l.textColor) {
+                return l.textColor;
+            }
+        }
+    }
+    for (UIView *sub in v.subviews) {
+        UIColor *c = IN_ScanStatusColor(sub, st, depth + 1, budget);
+        if (c) {
+            return c;
+        }
+    }
+    return nil;
+}
+
+static int IN_StatusBarPageLight(CGFloat *outLum) {
+    @try {
+        NSMutableArray *wins = [NSMutableArray array];
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) {
+                [wins addObjectsFromArray:((UIWindowScene *)s).windows];
+            }
+        }
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (![wins containsObject:w]) {
+                [wins addObject:w];
+            }
+        }
+        for (UIWindow *w in wins) {
+            int budget = 500;
+            BOOL st = ([NSStringFromClass([w class]) rangeOfString:@"StatusBar"
+                                                            options:NSCaseInsensitiveSearch].location != NSNotFound);
+            UIColor *c = IN_ScanStatusColor(w, st, 0, &budget);
+            CGFloat lum = 0.0;
+            if (c && IN_ColorLum(c, w.traitCollection, &lum)) {
+                *outLum = lum;
+                return lum <= 0.5 ? 1 : 0;
+            }
+        }
+    } @catch (NSException *e) {
+    }
+    return -1;
+}
+
+static int IN_SamplePageLuminance(UIWindow *window, CGFloat *outLum, int *method) {
+    *outLum = -1.0;
+    *method = 0;
+    @try {
+        UIView *snap = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:NO];
+        if (snap && window) {
+            int r = IN_RenderSample(snap, window, NO, outLum);
+            if (r >= 0) {
+                *method = 1;
+                return r;
+            }
+            r = IN_RenderSample(snap, window, YES, outLum);
+            if (r >= 0) {
+                *method = 2;
+                return r;
+            }
+        }
+        int r3 = IN_StatusBarPageLight(outLum);
+        if (r3 >= 0) {
+            *method = 3;
+            return r3;
+        }
+    } @catch (NSException *e) {
+    }
+    return -1;
 }
 
 static CGRect IN_TargetRect(UIView *banner, UIView *overlay) {
@@ -427,7 +532,8 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
     self.alpha = 0.0;
 
     CGFloat lum = -1.0;
-    int pageLight = IN_SamplePageLuminance(&lum);
+    int method = 0;
+    int pageLight = IN_SamplePageLuminance(self.window, &lum, &method);
     BOOL darkCard;
     if (pageLight == 1) {
         darkCard = YES;
@@ -437,10 +543,10 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
         darkCard = (self.window.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     }
 
-    if (styleLogCount < 8) {
+    if (styleLogCount < 12) {
         styleLogCount++;
-        IN_Log([NSString stringWithFormat:@"STYLE lum=%.2f pageLight=%d darkCard=%d",
-                lum, pageLight, (int)darkCard]);
+        IN_Log([NSString stringWithFormat:@"STYLE method=%d lum=%.2f pageLight=%d darkCard=%d",
+                method, lum, pageLight, (int)darkCard]);
     }
 
     self.overrideUserInterfaceStyle = darkCard ? UIUserInterfaceStyleDark : UIUserInterfaceStyleLight;
@@ -485,7 +591,7 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
             IN_Log(@"NCNotificationShortLookView not found, tweak inactive");
             return;
         }
-        IN_Log([NSString stringWithFormat:@"IslandNotify v4 loaded on iOS %@",
+        IN_Log([NSString stringWithFormat:@"IslandNotify v5 loaded on iOS %@",
                 [[UIDevice currentDevice] systemVersion]]);
         %init(IslandHooks);
     }
