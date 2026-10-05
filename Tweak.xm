@@ -10,13 +10,12 @@ static char kIsBannerKey;
 static char kLastAnimKey;
 
 static const CGFloat kNotchBottom = 30.0;
-static const CFTimeInterval kT1 = 0.30;
-static const CFTimeInterval kT2 = 0.48;
-static const CFTimeInterval kT3 = 1.00;
+static const CFTimeInterval kTravel = 0.46;
+static const CFTimeInterval kMorphStart = 0.34;
 static const CFTimeInterval kReveal = 0.80;
-static const CFTimeInterval kFadeStart = 0.90;
-static const CFTimeInterval kFadeLen = 0.20;
-static const CFTimeInterval kEnd = 1.12;
+static const CFTimeInterval kFadeStart = 0.84;
+static const CFTimeInterval kFadeLen = 0.22;
+static const CFTimeInterval kEnd = 1.10;
 
 static inline CGFloat IN_Clamp01(CGFloat x) {
     return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x);
@@ -26,24 +25,27 @@ static inline CGFloat IN_Lerp(CGFloat a, CGFloat b, CGFloat t) {
     return a + (b - a) * t;
 }
 
-static inline CGFloat IN_EaseOutCubic(CGFloat x) {
-    CGFloat p = 1.0 - x;
-    return 1.0 - p * p * p;
+static inline CGFloat IN_Smooth(CGFloat x) {
+    return x * x * (3.0 - 2.0 * x);
 }
 
-static inline CGFloat IN_EaseInOut(CGFloat x) {
+static inline CGFloat IN_EaseInOutCubic(CGFloat x) {
     if (x < 0.5) {
-        return 2.0 * x * x;
+        return 4.0 * x * x * x;
     }
     CGFloat p = -2.0 * x + 2.0;
-    return 1.0 - (p * p) / 2.0;
+    return 1.0 - (p * p * p) / 2.0;
 }
 
-static inline CGFloat IN_EaseOutBack(CGFloat x) {
-    const CGFloat c1 = 1.15;
-    const CGFloat c3 = c1 + 1.0;
-    CGFloat p = x - 1.0;
-    return 1.0 + c3 * p * p * p + c1 * p * p;
+static CGFloat IN_Spring(CFTimeInterval m) {
+    if (m <= 0.0) {
+        return 0.0;
+    }
+    const CGFloat zeta = 0.82;
+    const CGFloat omega = 13.0;
+    CGFloat wd = omega * sqrt(1.0 - zeta * zeta);
+    CGFloat decay = exp(-zeta * omega * m);
+    return 1.0 - decay * (cos(wd * m) + (zeta * omega / wd) * sin(wd * m));
 }
 
 static NSString *IN_Chain(UIView *v) {
@@ -185,6 +187,10 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
 
     CAShapeLayer *bulb = [CAShapeLayer layer];
     bulb.frame = ov.bounds;
+    bulb.shadowColor = [UIColor blackColor].CGColor;
+    bulb.shadowOffset = CGSizeMake(0.0, 8.0);
+    bulb.shadowRadius = 16.0;
+    bulb.shadowOpacity = 0.0;
 
     [ov.layer addSublayer:grad];
     [ov.layer addSublayer:bulb];
@@ -224,57 +230,43 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
     CGFloat cyT = CGRectGetMidY(R);
     CGFloat dist = MAX(cyT - y0, 40.0);
 
-    CGFloat by = y0;
-    CGFloat w = 12.0;
-    CGFloat h = 12.0;
-    CGFloat hTop = 14.0;
-    CGFloat hMid = 2.0;
-    CGFloat cxB = cx;
-    BOOL neckVisible = YES;
-
-    if (t <= kT1) {
-        CGFloat e = IN_EaseOutCubic(IN_Clamp01(t / kT1));
-        CGFloat rb = IN_Lerp(6.0, 18.0, e);
-        by = y0 + 0.6 * dist * e;
-        w = 2.0 * rb;
-        h = 2.0 * rb + 12.0 * e;
-        hTop = IN_Lerp(14.0, 34.0, e);
-        hMid = IN_Lerp(2.0, 14.0, e);
-    } else if (t <= kT2) {
-        CGFloat u = IN_Clamp01((t - kT1) / (kT2 - kT1));
-        by = y0 + dist * (0.6 + 0.4 * IN_EaseInOut(u));
-        w = 36.0;
-        h = 48.0;
-        hTop = IN_Lerp(34.0, 10.0, u);
-        hMid = 14.0 * (1.0 - u);
-        neckVisible = (u < 0.97);
-    } else {
-        neckVisible = NO;
-        if (!self.loggedRect) {
-            self.loggedRect = YES;
-            static int rectLogCount = 0;
-            if (rectLogCount < 4) {
-                rectLogCount++;
-                IN_Log([NSString stringWithFormat:@"TARGET x=%.1f y=%.1f w=%.1f h=%.1f",
-                        R.origin.x, R.origin.y, R.size.width, R.size.height]);
-            }
+    if (!self.loggedRect && t >= kMorphStart) {
+        self.loggedRect = YES;
+        static int rectLogCount = 0;
+        if (rectLogCount < 4) {
+            rectLogCount++;
+            IN_Log([NSString stringWithFormat:@"TARGET x=%.1f y=%.1f w=%.1f h=%.1f",
+                    R.origin.x, R.origin.y, R.size.width, R.size.height]);
         }
-        CGFloat m = IN_Clamp01((t - kT2) / (kT3 - kT2));
-        CGFloat em = IN_EaseOutBack(m);
-        by = cyT;
-        cxB = IN_Lerp(cx, CGRectGetMidX(R), em);
-        w = MAX(IN_Lerp(36.0, CGRectGetWidth(R), em), 4.0);
-        h = MAX(IN_Lerp(48.0, CGRectGetHeight(R), em), 4.0);
     }
 
-    CGFloat f;
-    if (t <= kT2) {
-        f = 0.5 * IN_Clamp01(t / kT2);
-    } else {
-        f = 0.5 + 0.5 * IN_Clamp01((t - kT2) / 0.32);
-    }
+    CGFloat x = IN_Clamp01((CGFloat)(t / kTravel));
+    CGFloat pos = IN_EaseInOutCubic(x);
+    CGFloat growth = IN_Smooth(IN_Clamp01(pos / 0.18));
+    CGFloat pinch = IN_Smooth(IN_Clamp01((pos - 0.35) / 0.20));
+    CGFloat retract = IN_Smooth(IN_Clamp01((pos - 0.50) / 0.30));
+
+    CGFloat rb = IN_Lerp(6.0, 18.0, IN_Smooth(IN_Clamp01((CGFloat)(t / 0.30))));
+    CGFloat by = y0 + dist * pos;
+    CGFloat tw = 2.0 * rb;
+    CGFloat th = 2.0 * rb + 14.0 * sin(M_PI * pos);
+    CGFloat hTop = IN_Lerp(IN_Lerp(14.0, 34.0, growth), 6.0, retract);
+    CGFloat hMid = 14.0 * growth * (1.0 - pinch);
+    CGFloat neckBottom = IN_Lerp(by, y0 + 10.0, retract);
+    BOOL neckVisible = (retract < 0.98);
+
+    CGFloat sp = IN_Spring(t - kMorphStart);
+    CGFloat w = MAX(IN_Lerp(tw, CGRectGetWidth(R), sp), 4.0);
+    CGFloat h = MAX(IN_Lerp(th, CGRectGetHeight(R), sp), 4.0);
+    CGFloat cxB = IN_Lerp(cx, CGRectGetMidX(R), sp);
+
+    CGFloat f = IN_Smooth(IN_Clamp01((CGFloat)((t - 0.08) / 0.55)));
     CGFloat finalLum = self.dark ? 0.17 : 1.0;
     UIColor *color = [UIColor colorWithWhite:IN_Lerp(0.0, finalLum, f) alpha:1.0];
+
+    CGRect br = CGRectMake(cxB - w / 2.0, by - h / 2.0, w, h);
+    UIBezierPath *bulbPath = [UIBezierPath bezierPathWithRoundedRect:br
+                                                        cornerRadius:MIN(MIN(w, h) / 2.0, 34.0)];
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -282,17 +274,18 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
     CGFloat topY = y0 - 6.0;
     if (neckVisible) {
         self.neckGradient.hidden = NO;
-        self.neckMask.path = IN_NeckPath(cx, topY, by, hTop, hMid).CGPath;
+        self.neckMask.path = IN_NeckPath(cx, topY, neckBottom, hTop, hMid).CGPath;
         self.neckGradient.startPoint = CGPointMake(0.5, topY / H);
-        self.neckGradient.endPoint = CGPointMake(0.5, MAX(by, topY + 1.0) / H);
+        self.neckGradient.endPoint = CGPointMake(0.5, MAX(neckBottom, topY + 1.0) / H);
         self.neckGradient.colors = @[(id)[UIColor blackColor].CGColor, (id)color.CGColor];
     } else {
         self.neckGradient.hidden = YES;
     }
 
-    CGRect br = CGRectMake(cxB - w / 2.0, by - h / 2.0, w, h);
-    self.bulb.path = [UIBezierPath bezierPathWithRoundedRect:br cornerRadius:MIN(w, h) / 2.0].CGPath;
+    self.bulb.path = bulbPath.CGPath;
     self.bulb.fillColor = color.CGColor;
+    self.bulb.shadowPath = bulbPath.CGPath;
+    self.bulb.shadowOpacity = (float)(0.20 * IN_Smooth(IN_Clamp01((CGFloat)((t - 0.34) / 0.30))));
 
     [CATransaction commit];
 }
@@ -319,7 +312,7 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
         } completion:nil];
     }
     if (t >= kFadeStart) {
-        self.overlay.alpha = 1.0 - IN_Clamp01((t - kFadeStart) / kFadeLen);
+        self.overlay.alpha = 1.0 - IN_Clamp01((CGFloat)((t - kFadeStart) / kFadeLen));
     }
     if (t >= kEnd) {
         [self finish];
@@ -419,7 +412,7 @@ static UIBezierPath *IN_NeckPath(CGFloat cx, CGFloat topY, CGFloat botY, CGFloat
             IN_Log(@"NCNotificationShortLookView not found, tweak inactive");
             return;
         }
-        IN_Log([NSString stringWithFormat:@"IslandNotify v2 loaded on iOS %@",
+        IN_Log([NSString stringWithFormat:@"IslandNotify v3 loaded on iOS %@",
                 [[UIDevice currentDevice] systemVersion]]);
         %init(IslandHooks);
     }
